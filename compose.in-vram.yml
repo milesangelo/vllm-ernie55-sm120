@@ -1,0 +1,106 @@
+# Profile A: Fast In-VRAM + DSpark Speculative Decoding (131,072 context)
+# Hardware: 2x NVIDIA RTX PRO 6000 Blackwell (96 GB VRAM each, sm_120, PCIe Gen5, no NVLink)
+#
+# Pulls unmodified official weights directly from Hugging Face (baidu/ERNIE-5.5-Flash-Preview, ~155 GiB).
+# Measured on 2x RTX PRO 6000 Max-Q:
+#   - Weights + bundled 3-layer DSpark: 80.0 GiB/GPU
+#   - FP8 KV cache: 5.66 GiB/GPU -> 201,115 tokens (1.53x @ 131K)
+#   - Single-stream decode (c=1): 93.2 tok/s median, 135 ms TTFT (DSpark avg 2.71 tok/step)
+#   - Concurrent decode (c=4): 211.6 tok/s aggregate (58.0 tok/s median/stream)
+#   - 115K NIAH prefill: 5,471 tok/s (21.0s), prefix-cache hit: 0.48s (44x speedup)
+#
+# Usage:
+#   docker compose -f compose.in-vram.yml up -d
+#   # Or build locally instead of pulling from GHCR:
+#   docker compose -f compose.in-vram.yml up -d --build
+services:
+  vllm:
+    image: ${VLLM_ERNIE_IMAGE:-ghcr.io/milesangelo/vllm-ernie55-sm120:v0.32.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    cap_add:
+      - SYS_PTRACE
+    gpus: all
+    ports:
+      - "${VLLM_BIND_HOST:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
+    environment:
+      CUDA_VISIBLE_DEVICES: "${CUDA_VISIBLE_DEVICES:-0,1}"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      TORCH_CUDA_ARCH_LIST: "12.0"
+      HOME: /cache
+      XDG_CACHE_HOME: /cache
+      HF_HOME: /models/hf-cache
+      # --trust-remote-code writes dynamic tokenizer modules here (safe even if /models is :ro).
+      HF_MODULES_CACHE: /cache/hf-modules
+      HF_TOKEN: "${HF_TOKEN:-}"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      VLLM_CONFIG_ROOT: /cache/vllm
+      VLLM_CACHE_ROOT: /cache/vllm
+      TRITON_CACHE_DIR: /cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
+      FLASHINFER_WORKSPACE_DIR: /cache/flashinfer
+      VLLM_NO_USAGE_STATS: "1"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      NCCL_CUMEM_ENABLE: "0"
+      # Prevents expandable_segments warnings near 0.95 GPU memory utilization.
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    volumes:
+      - "${HF_CACHE_DIR:-./models}:/models/hf-cache"
+      - "${VLLM_CACHE_DIR:-./cache}:/cache"
+    tmpfs:
+      - /tmp:size=16g,mode=1777,exec
+    stop_grace_period: 2m
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:8000/health]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 45m
+    entrypoint: [vllm, serve]
+    command:
+      - "${MODEL_PATH:-baidu/ERNIE-5.5-Flash-Preview}"
+      - --served-model-name
+      - "${SERVED_MODEL_NAME:-ernie-5.5-flash-preview}"
+      - --trust-remote-code
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - "2"
+      # PCIe-only dual Blackwell (no NVLink): custom_all_reduce faults during CUDA graph capture.
+      - --disable-custom-all-reduce
+      - --kv-cache-dtype
+      - fp8
+      - --max-model-len
+      - "131072"
+      - --max-num-seqs
+      - "8"
+      - --max-num-batched-tokens
+      - "4096"
+      # 8 concurrent seqs x (1 + 7 DSpark draft tokens) = 64 tokens/decode step.
+      - --max-cudagraph-capture-size
+      - "64"
+      # Keeps prefills eager (avoids breakable piecewise CUDA graph fault on short prompts)
+      # while capturing FULL CUDA graphs for decode across c=1..8.
+      - --compilation-config
+      - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+      - --gpu-memory-utilization
+      - "0.95"
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+      - --speculative-config
+      - '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+      - --reasoning-parser
+      - ernie5
+      - --tool-call-parser
+      - ernie5
+      - --enable-auto-tool-choice

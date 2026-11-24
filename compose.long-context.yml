@@ -1,0 +1,118 @@
+# Profile B: 1M Context (1,048,576) + Host RAM KV Offloading (SimpleCPUOffloadConnector)
+# Hardware: 2x NVIDIA RTX PRO 6000 Blackwell (96 GB VRAM each, sm_120, PCIe Gen5, no NVLink)
+#           >= 128 GB host RAM (default 16 GiB/rank = 32 GiB total; tune CPU_KV_BYTES_PER_RANK below)
+#
+# Pulls unmodified official weights directly from Hugging Face (baidu/ERNIE-5.5-Flash-Preview, ~155 GiB).
+# Disabling DSpark reclaims ~5.9 GiB/GPU (74.08 GiB weights/GPU), leaving 14.17 GiB/GPU for FP8 KV
+# cache (~1,059,602 tokens in VRAM), while SimpleCPUOffloadConnector stores evicted multi-session
+# prefixes in pinned host RAM for fast PCIe reload.
+#
+# Recommended CPU_KV_BYTES_PER_RANK presets (x2 ranks for TP2):
+#   - 128 GB host RAM: 17179869184  (16 GiB/rank =  32 GiB total; safe default)
+#   - 256 GB host RAM: 68719476736  (64 GiB/rank = 128 GiB total)
+#   - 512 GB host RAM: 137438953472 (128 GiB/rank = 256 GiB total)
+#
+# Measured on 2x RTX PRO 6000 Max-Q (128 GB host RAM, default 16 GiB/rank):
+#   - Weights (DSpark off): 74.08 GiB/GPU
+#   - GPU FP8 KV cache: 14.17 GiB/GPU -> 1,059,602 tokens (1.01x @ 1,048,576)
+#   - CPU offload pool: 16.00 GiB/rank (45,466 blocks/rank, 32 GiB total)
+#   - Single-stream decode (c=1): 82.3 tok/s median, 118 ms TTFT
+#   - 462K -> 600K eviction -> 462K CPU-offload reload: 2.12s (59.6x faster than 126.3s cold prefill)
+#   - 833K NIAH prefill: 2,784 tok/s (299.3s), 100% passkey recall
+#
+# Usage:
+#   docker compose -f compose.long-context.yml up -d
+#   # Example for a 256 GB RAM server:
+#   CPU_KV_BYTES_PER_RANK=68719476736 docker compose -f compose.long-context.yml up -d
+services:
+  vllm:
+    image: ${VLLM_ERNIE_IMAGE:-ghcr.io/milesangelo/vllm-ernie55-sm120:v0.32.0}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    cap_add:
+      - SYS_PTRACE
+    gpus: all
+    ports:
+      - "${VLLM_BIND_HOST:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
+    environment:
+      CUDA_VISIBLE_DEVICES: "${CUDA_VISIBLE_DEVICES:-0,1}"
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      TORCH_CUDA_ARCH_LIST: "12.0"
+      HOME: /cache
+      XDG_CACHE_HOME: /cache
+      HF_HOME: /models/hf-cache
+      # --trust-remote-code writes dynamic tokenizer modules here (safe even if /models is :ro).
+      HF_MODULES_CACHE: /cache/hf-modules
+      HF_TOKEN: "${HF_TOKEN:-}"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      VLLM_CONFIG_ROOT: /cache/vllm
+      VLLM_CACHE_ROOT: /cache/vllm
+      TRITON_CACHE_DIR: /cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
+      FLASHINFER_WORKSPACE_DIR: /cache/flashinfer
+      VLLM_NO_USAGE_STATS: "1"
+      VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+      NCCL_CUMEM_ENABLE: "0"
+      # Caps DSA sparse indexer logit scratch buffer so 1M prefill fits cleanly in VRAM.
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "256"
+      # Required for SimpleCPUOffloadConnector compatibility and avoids expandable_segments warnings.
+      PYTORCH_CUDA_ALLOC_CONF: ""
+    volumes:
+      - "${HF_CACHE_DIR:-./models}:/models/hf-cache"
+      - "${VLLM_CACHE_DIR:-./cache}:/cache"
+    tmpfs:
+      - /tmp:size=16g,mode=1777,exec
+    stop_grace_period: 2m
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:8000/health]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 45m
+    entrypoint: [vllm, serve]
+    command:
+      - "${MODEL_PATH:-baidu/ERNIE-5.5-Flash-Preview}"
+      - --served-model-name
+      - "${SERVED_MODEL_NAME:-ernie-5.5-flash-preview}"
+      - --trust-remote-code
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - "2"
+      # PCIe-only dual Blackwell (no NVLink): custom_all_reduce faults during CUDA graph capture.
+      - --disable-custom-all-reduce
+      - --kv-cache-dtype
+      - fp8
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-1048576}"
+      - --max-num-seqs
+      - "${MAX_NUM_SEQS:-2}"
+      - --max-num-batched-tokens
+      - "${MAX_NUM_BATCHED_TOKENS:-2048}"
+      - --max-cudagraph-capture-size
+      - "4"
+      # Keeps prefills eager (avoids breakable piecewise CUDA graph fault on short prompts)
+      # while capturing FULL CUDA graphs for decode across c=1..2.
+      - --compilation-config
+      - '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+      - --gpu-memory-utilization
+      - "${GPU_MEMORY_UTILIZATION:-0.98}"
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+      - --kv-transfer-config
+      - '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use_per_rank":${CPU_KV_BYTES_PER_RANK:-17179869184}}}'
+      - --reasoning-parser
+      - ernie5
+      - --tool-call-parser
+      - ernie5
+      - --enable-auto-tool-choice

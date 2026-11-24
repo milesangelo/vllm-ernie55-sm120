@@ -1,0 +1,21 @@
+# Generic LiteLLM Proxy configuration for baidu/ERNIE-5.5-Flash-Preview
+# Adjust api_base to match your Docker network or host URL, and adjust
+# max_input_tokens depending on whether you run compose.in-vram.yml (131072)
+# or compose.long-context.yml (1048576).
+
+model_list:
+  - model_name: ernie-5.5-flash-preview
+    litellm_params:
+      model: openai/ernie-5.5-flash-preview
+      api_base: http://localhost:8000/v1
+      api_key: not-needed
+      # ERNIE-5.5 supports exact reasoning_effort values: "low", "medium", "high" (default: "high").
+      allowed_openai_params:
+        - reasoning_effort
+    model_info:
+      mode: chat
+      max_input_tokens: 131072
+      max_output_tokens: 65536
+      supports_vision: false
+      supports_function_calling: true
+      supports_reasoning: true
