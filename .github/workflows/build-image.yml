@@ -41,6 +41,11 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,prefix=sha-
 
+      - name: Free runner disk space for large CUDA base image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
